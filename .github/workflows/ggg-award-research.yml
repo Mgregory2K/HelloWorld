@@ -8,17 +8,13 @@ on:
 permissions:
   contents: read
 
-env:
-  API_URL: https://api.usaspending.gov/api/v2/search/spending_by_award/
-
 jobs:
   pull-and-grade:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-
-      - name: Pull, grade, and cluster 1,000 awards
+      - name: Pull and grade 1,000 likely-completed awards
         shell: bash
         run: |
           cat > /tmp/pull.py <<'PY'
@@ -27,51 +23,79 @@ jobs:
           from datetime import date
           URL='https://api.usaspending.gov/api/v2/search/spending_by_award/'
           fields=['Award ID','Recipient Name','Start Date','End Date','Award Amount','Awarding Agency','Awarding Sub Agency','Contract Award Type','NAICS','PSC','Description','Place of Performance State Code','Primary Place of Performance','generated_internal_id']
-          filters={'award_type_codes':['A','B','C','D'],'time_period':[{'start_date':'2023-10-01','end_date':'2026-06-30','date_type':'new_awards_only'}],'award_amounts':[{'lower_bound':500,'upper_bound':250000}]}
-          rows=[]
-          for page in range(1,21):
-              payload={'subawards':False,'limit':100,'page':page,'order':'desc','sort':'End Date','filters':filters,'fields':fields}
-              req=urllib.request.Request(URL,data=json.dumps(payload).encode(),headers={'Content-Type':'application/json','User-Agent':'GGG-research/1.0'})
+          filters={'award_type_codes':['A','B','C','D'],'time_period':[{'start_date':'2022-10-01','end_date':'2026-06-30','date_type':'new_awards_only'}],'award_amounts':[{'lower_bound':500,'upper_bound':250000}]}
+          raw=[]
+          for page in range(1,51):
+              payload={'subawards':False,'limit':100,'page':page,'order':'asc','sort':'Award Amount','filters':filters,'fields':fields}
+              req=urllib.request.Request(URL,data=json.dumps(payload).encode(),headers={'Content-Type':'application/json','User-Agent':'GGG-research/2.0'})
               with urllib.request.urlopen(req,timeout=90) as r: data=json.load(r)
-              batch=data.get('results',[]); rows.extend(batch)
-              if len(rows)>=1000 or not batch: break
-          rows=rows[:1000]
-          reject={'construction','architect','engineering','medical','surgical','pharmaceutical','hazardous','ammunition','weapon','aircraft','ship repair','janitorial service','guard service','training','software development','professional service','research and development','clinical','laboratory'}
-          good={'paper','cup','cups','liner','liners','trash bag','office supplies','toner','cartridge','cable','adapter','storage bin','packaging','shipping supplies','cleaning supplies','disposable','labels','envelopes','folders','filters','gloves','wipes','sanitary','hardware','tools','parts','equipment','supplies'}
-          risky={'custom','installation','on-site','onsite','repair','maintenance','service','subscription','license','training','calibration','hazmat','refrigerated','perishable','medical','surgical','controlled','classified'}
+              batch=data.get('results',[]); raw.extend(batch)
+              if not batch: break
+          today=str(date.today())
+          rows=[]; seen=set()
+          for r in raw:
+              aid=r.get('Award ID'); end=r.get('End Date') or ''
+              if not aid or aid in seen or not end or end>today: continue
+              seen.add(aid); rows.append(r)
+              if len(rows)>=1000: break
+          def codeval(v):
+              return str(v.get('code','')) if isinstance(v,dict) else str(v or '')
+          def descval(v):
+              return str(v.get('description','')) if isinstance(v,dict) else ''
+          hard_exclude={'construction','architect','engineering service','medical','surgical','pharmaceutical','hazardous','ammunition','weapon','aircraft','ship repair','guard service','clinical','laboratory','research and development','r&d','munition','missile','explosive'}
+          good={'paper','cup','liner','trash bag','office supplies','toner','cartridge','cable','adapter','storage','packaging','shipping supplies','cleaning supplies','disposable','labels','envelopes','folders','filters','gloves','wipes','sanitary','hardware','tools','parts','equipment','supplies','furniture','appliance','printer','computer accessory','janitorial supplies'}
+          service_risk={'installation','on-site','onsite','repair','maintenance','subscription','license','training','calibration','consulting','support service','staffing','professional services'}
+          regulated={'refrigerated','perishable','medical','surgical','controlled','classified','hazmat','chemical','food','vaccine','drug'}
           def grade(r):
-              d=(r.get('Description') or '').lower(); amt=float(r.get('Award Amount') or 0); psc=str(r.get('PSC') or ''); naics=str(r.get('NAICS') or '')
-              score=45; reasons=[]
-              if 1000<=amt<=25000: score+=18; reasons.append('starter-size')
-              elif 25000<amt<=75000: score+=9; reasons.append('scale-size')
-              elif amt>150000: score-=15; reasons.append('large-exposure')
-              if any(t in d for t in good): score+=20; reasons.append('commercial-product signal')
-              if psc and psc[0].isdigit(): score+=8; reasons.append('product PSC')
-              if naics.startswith(('42','44','45')): score+=7; reasons.append('trade NAICS')
-              bad=next((t for t in reject if t in d),None); risk=next((t for t in risky if t in d),None)
-              if bad: score-=35; reasons.append('excluded:'+bad)
-              if risk: score-=15; reasons.append('risk:'+risk)
-              if len(d)<12: score-=8; reasons.append('thin description')
+              d=' '.join([(r.get('Description') or ''),descval(r.get('PSC')),descval(r.get('NAICS'))]).lower()
+              amt=float(r.get('Award Amount') or 0); psc=codeval(r.get('PSC')); naics=codeval(r.get('NAICS'))
+              score=42; reasons=[]
+              if 500<=amt<5000: score+=20; reasons.append('launch-size')
+              elif amt<25000: score+=16; reasons.append('starter-size')
+              elif amt<75000: score+=8; reasons.append('scale-size')
+              elif amt>150000: score-=12; reasons.append('large-exposure')
+              if psc and psc[0].isdigit(): score+=14; reasons.append('product PSC')
+              elif psc.startswith(('7','H','J','R','S','U','V','Z')): score-=8; reasons.append('service/complex PSC')
+              if any(t in d for t in good): score+=18; reasons.append('commercial-product signal')
+              if naics.startswith(('423','424','425','444','449','455','459')): score+=8; reasons.append('distribution NAICS')
+              bad=next((t for t in hard_exclude if t in d),None)
+              risk=next((t for t in service_risk if t in d),None)
+              reg=next((t for t in regulated if t in d),None)
+              if bad: score-=45; reasons.append('excluded:'+bad)
+              if risk: score-=18; reasons.append('service risk:'+risk)
+              if reg: score-=30; reasons.append('regulated:'+reg)
+              if naics.startswith(('3364','5413','5417','621','622','3254','237','236')): score-=25; reasons.append('high-risk NAICS')
+              if len((r.get('Description') or '').strip())<15: score-=6; reasons.append('thin description')
               score=max(0,min(100,score)); tier='A' if score>=80 else 'B' if score>=65 else 'C' if score>=45 else 'D'
-              return score,tier,'; '.join(reasons)
+              return score,tier,'; '.join(reasons),psc,naics
           out=[]
           for r in rows:
-              s,t,w=grade(r); out.append({**r,'GGG Score':s,'GGG Tier':t,'Grade Reasons':w,'Likely Completed':'Yes' if (r.get('End Date') or '') < str(date.today()) else 'No'})
-          out.sort(key=lambda x:(x['GGG Score'],float(x.get('Award Amount') or 0)),reverse=True)
-          cols=fields+['GGG Score','GGG Tier','Grade Reasons','Likely Completed']
+              s,t,w,psc,naics=grade(r)
+              x={**r,'PSC Code':psc,'PSC Description':descval(r.get('PSC')),'NAICS Code':naics,'NAICS Description':descval(r.get('NAICS')),'GGG Score':s,'GGG Tier':t,'Grade Reasons':w,'Likely Completed':'Yes'}
+              out.append(x)
+          out.sort(key=lambda x:(x['GGG Score'],-float(x.get('Award Amount') or 0)),reverse=True)
+          cols=['Award ID','Recipient Name','Start Date','End Date','Award Amount','Awarding Agency','Awarding Sub Agency','Contract Award Type','NAICS Code','NAICS Description','PSC Code','PSC Description','Description','Place of Performance State Code','Primary Place of Performance','generated_internal_id','GGG Score','GGG Tier','Grade Reasons','Likely Completed']
           def write(name,data):
               with open(name,'w',newline='',encoding='utf-8-sig') as f:
                   w=csv.DictWriter(f,fieldnames=cols,extrasaction='ignore'); w.writeheader(); w.writerows(data)
           write('ggg_awards_1000.csv',out)
-          write('ggg_manual_review_100.csv',out[:60]+out[470:490]+out[-20:])
-          write('ggg_deep_dive_20.csv',[x for x in out if x['GGG Tier'] in ('A','B') and x['Likely Completed']=='Yes'][:20])
-          def top(field,n=25): return Counter(str(x.get(field) or 'Unknown') for x in out if x['GGG Tier'] in ('A','B')).most_common(n)
-          summary={'records':len(out),'tiers':dict(Counter(x['GGG Tier'] for x in out)),'top_naics':top('NAICS'),'top_psc':top('PSC'),'top_agencies':top('Awarding Agency'),'amount_bands':dict(Counter('0.5-5k' if float(x.get('Award Amount') or 0)<5000 else '5-25k' if float(x.get('Award Amount') or 0)<25000 else '25-75k' if float(x.get('Award Amount') or 0)<75000 else '75-250k' for x in out))}
+          # 60 strongest, 20 middle, 20 weakest to audit both hits and misses
+          write('ggg_manual_review_100.csv',out[:60]+out[max(0,len(out)//2-10):len(out)//2+10]+out[-20:])
+          deep=[]; vendors=Counter()
+          for x in out:
+              if x['GGG Tier'] not in ('A','B'): continue
+              vendor=x.get('Recipient Name') or 'Unknown'
+              if vendors[vendor]>=3: continue
+              vendors[vendor]+=1; deep.append(x)
+              if len(deep)>=20: break
+          write('ggg_deep_dive_20.csv',deep)
+          eligible=[x for x in out if x['GGG Tier'] in ('A','B')]
+          def top(field,n=25): return Counter(str(x.get(field) or 'Unknown') for x in eligible).most_common(n)
+          summary={'records':len(out),'tiers':dict(Counter(x['GGG Tier'] for x in out)),'top_naics':top('NAICS Code'),'top_psc':top('PSC Code'),'top_agencies':top('Awarding Agency'),'top_vendors':top('Recipient Name'),'amount_bands':dict(Counter('0.5-5k' if float(x.get('Award Amount') or 0)<5000 else '5-25k' if float(x.get('Award Amount') or 0)<25000 else '25-75k' if float(x.get('Award Amount') or 0)<75000 else '75-250k' for x in out))}
           with open('ggg_summary.json','w') as f: json.dump(summary,f,indent=2)
           print(json.dumps(summary,indent=2))
           PY
           python /tmp/pull.py
-
       - uses: actions/upload-artifact@v4
         with:
           name: ggg-award-research
