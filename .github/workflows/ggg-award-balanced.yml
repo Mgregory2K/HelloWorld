@@ -67,8 +67,8 @@ jobs:
                           "award_amounts": [{"lower_bound": lower, "upper_bound": upper}]
                       },
                       "fields": fields,
-                      "sort": "Award Amount",
-                      "order": "asc"
+                      "sort": "End Date",
+                      "order": "desc"
                   }
                   for attempt in range(4):
                       resp = requests.post(ENDPOINT, json=payload, timeout=90)
