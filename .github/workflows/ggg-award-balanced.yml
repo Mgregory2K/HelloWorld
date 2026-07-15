@@ -68,7 +68,7 @@ jobs:
                       },
                       "fields": fields,
                       "sort": "End Date",
-                      "order": "desc"
+                      "order": "asc"
                   }
                   for attempt in range(4):
                       resp = requests.post(ENDPOINT, json=payload, timeout=90)
