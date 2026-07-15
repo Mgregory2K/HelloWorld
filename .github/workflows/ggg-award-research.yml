@@ -18,21 +18,27 @@ jobs:
         shell: bash
         run: |
           cat > /tmp/pull.py <<'PY'
-          import csv, json, urllib.request
+          import csv, json, time, urllib.request
           from collections import Counter
           from datetime import date
           URL='https://api.usaspending.gov/api/v2/search/spending_by_award/'
           fields=['Award ID','Recipient Name','Start Date','End Date','Award Amount','Awarding Agency','Awarding Sub Agency','Contract Award Type','NAICS','PSC','Description','Place of Performance State Code','Primary Place of Performance','generated_internal_id']
-          bands=[('Launch $500-$5K',500,4999.99),('Starter $5K-$25K',5000,24999.99),('Scale $25K-$75K',25000,74999.99),('Growth $75K-$250K',75000,250000)]
+          bands=[('Launch $500-$5K',500,4999),('Starter $5K-$25K',5000,24999),('Scale $25K-$75K',25000,74999),('Growth $75K-$250K',75000,250000)]
           today=str(date.today()); rows=[]; seen=set()
+          def post(payload):
+              for attempt in range(4):
+                  try:
+                      req=urllib.request.Request(URL,data=json.dumps(payload).encode(),headers={'Content-Type':'application/json','User-Agent':'GGG-research/4.0'})
+                      with urllib.request.urlopen(req,timeout=90) as r: return json.load(r)
+                  except Exception:
+                      if attempt==3: raise
+                      time.sleep(3*(attempt+1))
           for band,low,high in bands:
               kept=[]
-              filters={'award_type_codes':['A','B','C','D'],'time_period':[{'start_date':'2022-10-01','end_date':'2026-06-30','date_type':'new_awards_only'}],'award_amounts':[{'lower_bound':low,'upper_bound':high}]}
-              for page in range(1,31):
+              filters={'award_type_codes':['A','B','C','D'],'time_period':[{'start_date':'2022-10-01','end_date':'2024-09-30','date_type':'new_awards_only'}],'award_amounts':[{'lower_bound':low,'upper_bound':high}]}
+              for page in range(1,13):
                   payload={'subawards':False,'limit':100,'page':page,'order':'asc','sort':'Award Amount','filters':filters,'fields':fields}
-                  req=urllib.request.Request(URL,data=json.dumps(payload).encode(),headers={'Content-Type':'application/json','User-Agent':'GGG-research/3.0'})
-                  with urllib.request.urlopen(req,timeout=90) as r: data=json.load(r)
-                  batch=data.get('results',[])
+                  batch=post(payload).get('results',[])
                   for item in batch:
                       aid=item.get('Award ID'); end=item.get('End Date') or ''
                       if aid and aid not in seen and end and end<=today:
